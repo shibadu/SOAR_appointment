@@ -26,6 +26,7 @@ import time
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from redcap import Project
 
@@ -471,6 +472,29 @@ def bar_counts(series, title, color="#2980b9", horizontal=True):
     show_plot(fig)
 
 
+def visit_heatmap(U):
+    """Heat map: one row per day, one column per visit type; the row total is
+    in each day label and the column total in each visit-type header."""
+    pv = U.pivot_table(index="Expected on", columns="Appointment", values="Record ID",
+                       aggfunc="count", fill_value=0)
+    cols = [a for a in APPT_ORDER if a in pv.columns]
+    pv = pv[cols].sort_index()
+    row_tot, col_tot = pv.sum(axis=1), pv.sum(axis=0)
+    ylab = [f"{d:%a %d %b}  ·  total {int(t)}" for d, t in row_tot.items()]
+    xlab = [f"{c}<br>total {int(col_tot[c])}" for c in cols]
+    z = pv.values
+    text = [[str(int(v)) if v else "" for v in row] for row in z]
+    fig = go.Figure(go.Heatmap(
+        z=z, x=xlab, y=ylab, text=text, texttemplate="%{text}", zmin=0,
+        colorscale="YlOrRd", showscale=False, xgap=2, ygap=2,
+        hovertemplate="%{y}<br>%{x}<br>Visits: %{z}<extra></extra>"))
+    fig.update_yaxes(autorange="reversed", type="category")
+    fig.update_xaxes(side="top", type="category")
+    fig.update_layout(title=f"Visits by day and visit type · {int(z.sum())} in total",
+                      height=max(220, 110 + 38 * len(ylab)))
+    show_plot(fig)
+
+
 # ───────────────────────────────────────────────────────────────
 # PAGE 1 - SUMMARY
 # ───────────────────────────────────────────────────────────────
@@ -526,24 +550,28 @@ def page_summary(m, today):
 
     # 2 ── Upcoming visits ────────────────────────────────────────
     with tab2:
-        horizon = st.select_slider("Look ahead (days)", options=[7, 14, 21, 30, 60], value=14)
-        U = S[S["Status"].isin(["Due now", "Upcoming"])].copy()
+        mode = st.radio("View", ["Look ahead", "Specific date"], horizontal=True)
+        U = S.copy()
         U["Expected on"] = U["Effective date"].fillna(U["Target date"])
         U["Days until"] = (U["Expected on"] - today).dt.days
-        U = U[U["Days until"] <= horizon].sort_values("Expected on")
+        if mode == "Look ahead":
+            horizon = st.select_slider("Look ahead (days)", options=[7, 14, 21, 30, 60], value=14)
+            U = U[U["Status"].isin(["Due now", "Upcoming"]) & (U["Days until"] <= horizon)]
+        else:
+            pick = pd.Timestamp(st.date_input("Visit date", value=today.date()))
+            U = U[U["Expected on"] == pick]
+            st.caption("Shows every appointment expected on this date (the booked date if there is one, "
+                       "otherwise the target date), whatever its status.")
+        U = U.sort_values(["Expected on", "Study ID"])
         c = st.columns(4)
-        c[0].metric("Due now (window open)", int((U["Status"] == "Due now").sum()))
-        c[1].metric("Today", int((U["Days until"] == 0).sum()))
-        c[2].metric(f"Next {horizon} days", len(U))
+        c[0].metric("Visits", len(U))
+        c[1].metric("Due now (window open)", int((U["Status"] == "Due now").sum()))
+        c[2].metric("Booked", int((U["Booked"] == "Yes").sum()))
         c[3].metric("Not yet booked", int((U["Booked"] == "No").sum()))
         if U.empty:
-            st.success("No upcoming appointments in this period.")
+            st.success("No appointments for this selection.")
         else:
-            g = U.groupby("Expected on").size().reset_index(name="Appointments")
-            fig = px.bar(g, x="Expected on", y="Appointments", title="Appointments expected per day")
-            fig.update_traces(marker_color="#2980b9")
-            fig.update_layout(xaxis_title="")
-            show_plot(fig)
+            visit_heatmap(U)
             out = fmt_dates(U, ["Expected on", "Target date", "Window opens", "Window closes", "Booked date"])
             show_df(out[["Study ID", "Record ID", "Arm", "Appointment", "Status", "Expected on",
                          "Days until", "Window opens", "Window closes", "Booked", "Call outcome"]])
@@ -573,6 +601,26 @@ def page_summary(m, today):
             x = fmt_dates(M[M["Tracing attempts"] == 0], ["Window closes"])
             show_df(x[["Study ID", "Record ID", "Appointment", "Window closes", "Days past window"]])
 
+        st.markdown("**Tracing register (per participant and appointment)**")
+        if T.empty:
+            st.caption("No tracing attempts recorded yet.")
+        else:
+            g = T.assign(_type=lab(get(T, "ta_type"), TA_TYPE), _app=lab(get(T, "ta_visit"), APPT_LABELS),
+                         _out=lab(get(T, "ta_outcome"), TA_OUTCOME))
+            reg = []
+            for (r, a), d in g.groupby(["_rid", "_app"], sort=False):
+                d = d.sort_values(["ta_date", "_inst"])
+                last = d.iloc[-1]
+                reg.append({
+                    "Study ID": m["sid"].get(r, ""), "Record ID": r, "Appointment": a,
+                    "Tracing types used": ", ".join(dict.fromkeys(x for x in d["_type"] if x)),
+                    "Tracing attempts": len(d), "Last tracing type": last["_type"],
+                    "Last attempt": last["ta_date"], "Last outcome": last["_out"],
+                })
+            reg = pd.DataFrame(reg).sort_values("Last attempt", ascending=False)
+            show_df(fmt_dates(reg, ["Last attempt"]))
+            download(fmt_dates(reg, ["Last attempt"]), "tracing_summary_register.csv")
+
     # 4 ── Booking summary ────────────────────────────────────────
     with tab4:
         open_ = S[S["Status"].isin(["Due now", "Upcoming", "Missed"])]
@@ -598,6 +646,19 @@ def page_summary(m, today):
         else:
             need = fmt_dates(need, ["Target date", "Window opens", "Window closes"])
             show_df(need[["Study ID", "Record ID", "Appointment", "Target date", "Window opens", "Window closes"]])
+
+        st.markdown("**Booking register: reminder calls (per participant and appointment)**")
+        BK = S[S["Booked"] == "Yes"].copy()
+        if BK.empty:
+            st.caption("No bookings recorded yet.")
+        else:
+            BK["Call made"] = BK["Call attempt date"].notna().map({True: "Yes", False: "No"})
+            BK = BK.rename(columns={"Call attempt date": "Call date", "Who was contacted": "Person called"})
+            BK = fmt_dates(BK, ["Booked date", "Call date"])
+            bcols = ["Study ID", "Record ID", "Appointment", "Booked date", "Call made", "Call date",
+                     "Person called", "Call outcome"]
+            show_df(BK[bcols])
+            download(BK[bcols], "booking_call_register.csv")
 
 
 # ───────────────────────────────────────────────────────────────
